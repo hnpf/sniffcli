@@ -32,7 +32,7 @@ sudo ./sniffcli [flags]
 
 ## Quick Start
 
-If you're on Arch, just make sure you have `libpcap` installed.
+Simply just make sure you have `libpcap` installed.
 
 ```bash
 # Install dependencies
