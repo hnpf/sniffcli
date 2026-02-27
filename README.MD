@@ -9,7 +9,7 @@ An extremely minimal, high-performance packet sniffer built with **Go** and **Bu
 ## Usage
 
 ```bash
-./sniffcli [flags]
+sudo ./sniffcli [flags]
 ```
 
 ### Flags:
