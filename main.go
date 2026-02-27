@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -28,25 +29,33 @@ var (
 	alertStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF0000")).
 			Bold(true)
-	subtleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#626262"))
-	knownDevices = map[string]string{
-		"127.0.0.1":       "Localhost",
-		"192.168.1.1":     "Router",
-		"192.168.1.185":   "Main Rig",
-		"fe80::1":         "Gateway",
+		subtleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#626262"))
+		watchStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFA500")).
+				Bold(true)
+		knownDevices = map[string]string{
+			"127.0.0.1":       "Localhost",
+			"192.168.1.1":     "Router",
+			"192.168.1.185":   "Main Rig",
+			"fe80::1":         "Gateway",
+			"aa:bb:cc:dd:ee:ff": "Pixel 10 Pro",
+		}
+	)
+	
+	type packetInfo struct {
+		Timestamp   time.Time
+		Source      string
+		Dest      string
+		Proto       string
+		Length      int
+		Info        string
+		IsAlert     bool
+		IsDiscovery bool
+		IsWatched   bool
+		IsCritical  bool
 	}
-)
-
-type packetInfo struct {
-	Timestamp time.Time
-	Source    string
-	Dest      string
-	Proto     string
-	Length    int
-	Info      string
-	IsAlert   bool
-}
+	
 
 func formatAddr(addr string) string {
 	if name, ok := knownDevices[addr]; ok {
@@ -60,20 +69,51 @@ func (p packetInfo) String() string {
 	src := formatAddr(p.Source)
 	dst := formatAddr(p.Dest)
 	srcDest := fmt.Sprintf("  %15s -> %-15s", src, dst)
+
+	if p.IsCritical {
+		return alertStyle.Render(fmt.Sprintf("[%s] CRITICAL: %s | %s %s", timestamp, p.Info, srcDest, p.Proto))
+	}
 	if p.IsAlert {
 		return alertStyle.Render(fmt.Sprintf("[%s] ALERT: %s | %s %s", timestamp, p.Info, srcDest, p.Proto))
+	}
+	if p.IsWatched {
+		return watchStyle.Render(fmt.Sprintf("[%s] WATCH: %s | %s %s", timestamp, p.Info, srcDest, p.Proto))
 	}
 	return fmt.Sprintf("[%s] %s | %-4s %d bytes %s", subtleStyle.Render(timestamp), srcDest, infoStyle.Render(p.Proto), p.Length, subtleStyle.Render(p.Info))
 }
 
+func (p packetInfo) ToLogString() string {
+	timestamp := p.Timestamp.Format("15:04:05")
+	src := formatAddr(p.Source)
+	dst := formatAddr(p.Dest)
+	srcDest := fmt.Sprintf("%15s -> %-15s", src, dst)
+	prefix := ""
+	if p.IsCritical {
+		prefix = "CRITICAL: "
+	} else if p.IsAlert {
+		prefix = "ALERT: "
+	} else if p.IsWatched {
+		prefix = "WATCH: "
+	}
+
+	if prefix != "" {
+		return fmt.Sprintf("[%s] %s%s | %s %s", timestamp, prefix, p.Info, srcDest, p.Proto)
+	}
+	return fmt.Sprintf("[%s] %15s -> %-15s | %-4s %d bytes %s", timestamp, src, dst, p.Proto, p.Length, p.Info)
+}
+
 type model struct {
-	viewport      viewport.Model
-	packets       []packetInfo
-	sshAttempts   map[string]int
-	outboundCount int
-	ready         bool
-	iface         string
-	localIPs      map[string]bool
+	viewport        viewport.Model
+	packets         []packetInfo
+	sshAttempts     map[string]int
+	outboundCount   int
+	ready           bool
+	iface           string
+	localIPs        map[string]bool
+	logFile         *os.File
+	filterDiscovery bool
+	flushLogs       bool
+	watchlist       map[string]bool
 }
 
 type packetMsg packetInfo
@@ -107,6 +147,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case packetMsg:
 		p := packetInfo(msg)
+		if m.filterDiscovery && p.IsDiscovery {
+			return m, nil
+		}
+		if m.logFile != nil {
+			m.logFile.WriteString(p.ToLogString() + "\n")
+			if m.flushLogs {
+				m.logFile.Sync()
+			}
+		}
 		if p.IsAlert {
 			if strings.Contains(p.Info, "SSH") {
 				m.sshAttempts[p.Source]++
@@ -209,7 +258,7 @@ func isSafePort(port int, isUDP bool) bool {
 	return false
 }
 
-func startSniffing(iface string, p *tea.Program) {
+func startSniffing(iface string, watchlist map[string]bool, p *tea.Program) {
 	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal(err)
@@ -218,28 +267,48 @@ func startSniffing(iface string, p *tea.Program) {
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	localIPs := getLocalIPs()
 	sshCounters := make(map[string]int)
+
+	isInsecurePort := func(port int) bool {
+		return port == 80 || port == 21 || port == 23 || port == 25 || port == 110 || port == 143
+	}
+
 	for packet := range packetSource.Packets() {
 		info := packetInfo{
 			Timestamp: time.Now(),
 			Length:    len(packet.Data()),
 			Proto:     "UNK",
 		}
+
+		var srcMAC string
+		if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
+			eth, _ := ethLayer.(*layers.Ethernet)
+			srcMAC = eth.SrcMAC.String()
+			info.IsWatched = watchlist[srcMAC]
+		}
+
 		if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
 			arp, _ := arpLayer.(*layers.ARP)
 			info.Proto = "ARP"
 			info.Source = net.HardwareAddr(arp.SourceHwAddress).String()
 			info.Dest = net.HardwareAddr(arp.DstHwAddress).String()
 			info.Info = fmt.Sprintf("Who has %s?", net.IP(arp.DstProtAddress))
+			info.IsDiscovery = true
 		} else if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 			ip, _ := ipLayer.(*layers.IPv4)
 			info.Source = ip.SrcIP.String()
 			info.Dest = ip.DstIP.String()
 			info.Proto = "IPv4"
+			if strings.HasPrefix(info.Dest, "224.0.0.") {
+				info.IsDiscovery = true
+			}
 		} else if ipLayer := packet.Layer(layers.LayerTypeIPv6); ipLayer != nil {
 			ip, _ := ipLayer.(*layers.IPv6)
 			info.Source = ip.SrcIP.String()
 			info.Dest = ip.DstIP.String()
 			info.Proto = "IPv6"
+			if strings.HasPrefix(info.Dest, "ff02:") {
+				info.IsDiscovery = true
+			}
 		} else if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
 			eth, _ := ethLayer.(*layers.Ethernet)
 			info.Proto = "ETH"
@@ -252,6 +321,15 @@ func startSniffing(iface string, p *tea.Program) {
 			info.Proto = "TCP"
 			dstPort := int(tcp.DstPort)
 			info.Info = fmt.Sprintf("%d -> %d", tcp.SrcPort, dstPort)
+
+			if info.IsWatched && isInsecurePort(dstPort) {
+				info.IsCritical = true
+				info.Info = fmt.Sprintf("INSECURE TRAFFIC (%d)", dstPort)
+			}
+
+			if dstPort == 5353 || dstPort == 1900 {
+				info.IsDiscovery = true
+			}
 
 			if dstPort == 22 {
 				sshCounters[info.Source]++
@@ -272,6 +350,15 @@ func startSniffing(iface string, p *tea.Program) {
 			info.Proto = "UDP"
 			dstPort := int(udp.DstPort)
 			info.Info = fmt.Sprintf("%d -> %d", udp.SrcPort, dstPort)
+
+			if info.IsWatched && isInsecurePort(dstPort) {
+				info.IsCritical = true
+				info.Info = fmt.Sprintf("INSECURE TRAFFIC (%d)", dstPort)
+			}
+
+			if dstPort == 5353 || dstPort == 1900 || dstPort == 67 || dstPort == 68 {
+				info.IsDiscovery = true
+			}
 
 			if localIPs[info.Source] && !isLocalIP(info.Dest) {
 				if !isSafePort(dstPort, true) {
@@ -304,20 +391,57 @@ func isLocalIP(ipStr string) bool {
 }
 
 func main() {
-	iface := findBestInterface()
-	if len(os.Args) > 1 {
-		iface = os.Args[1]
+	defaultIface := findBestInterface()
+	ifaceFlag := flag.String("i", "", "network interface to sniff on")
+	logFlag := flag.Bool("l", false, "save sniffer output to a file")
+	cleanFlag := flag.Bool("c", false, "filter out discovery and multicast traffic")
+	followFlag := flag.Bool("f", false, "follow mode: enable logging and flush immediately")
+	watchFlag := flag.String("w", "", "comma-separated list of MAC addresses to watch")
+	flag.Parse()
+
+	iface := *ifaceFlag
+	if iface == "" {
+		if flag.NArg() > 0 {
+			iface = flag.Arg(0)
+		} else {
+			iface = defaultIface
+		}
+	}
+
+	watchlist := make(map[string]bool)
+	if *watchFlag != "" {
+		macs := strings.Split(*watchFlag, ",")
+		for _, mac := range macs {
+			watchlist[strings.ToLower(strings.TrimSpace(mac))] = true
+		}
+	}
+
+	var logFile *os.File
+	if *logFlag || *followFlag {
+		fileName := fmt.Sprintf("sniff_%s.log", time.Now().Format("2006-01-02"))
+		var err error
+		logFile, err = os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Printf("Could not open log file: %v\n", err)
+			os.Exit(1)
+		}
+		defer logFile.Close()
+		fmt.Fprintf(logFile, "\n--- Session started at %s ---\n", time.Now().Format(time.RFC3339))
 	}
 
 	m := model{
-		iface:       iface,
-		sshAttempts: make(map[string]int),
-		localIPs:    getLocalIPs(),
+		iface:           iface,
+		sshAttempts:     make(map[string]int),
+		localIPs:        getLocalIPs(),
+		logFile:         logFile,
+		filterDiscovery: *cleanFlag,
+		flushLogs:       *followFlag,
+		watchlist:       watchlist,
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
-	go startSniffing(iface, p)
+	go startSniffing(iface, watchlist, p)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)

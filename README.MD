@@ -1,8 +1,23 @@
-# 🐾 SniffCLI the E-Waste Sentry
+# 🐾 SniffCLI the Sniffer Sentry
 
 > *"If it works on my machine, it's production ready."*
 
 An extremely minimal, high-performance packet sniffer built with **Go** and **Bubble Tea**. Designed to monitor local network traffic across home lab hardware, from main rigs to aging e-waste.
+
+---
+
+## Usage
+
+```bash
+./sniffcli [flags]
+```
+
+### Flags:
+- `-i <interface>`: Network interface to sniff on (e.g., `eth0`).
+- `-l`: Enable logging. Saves all sniffer output to `sniff_YYYY-MM-DD.log`.
+- `-c`: Clean mode. Filters out noisy discovery and multicast traffic (ARP, MDNS, SSDP, DHCP, ff02::).
+- `-f`: Follow mode. Enables logging and ensures the file is flushed immediately so you can `tail -f` the log in another terminal.
+- `-w <macs>`: Watchlist. A comma-separated list of MAC addresses to watch. Traffic from these devices is highlighted in orange, and insecure traffic (HTTP/FTP/Telnet/SMTP) triggers a bright red CRITICAL alert.
 
 ---
 
