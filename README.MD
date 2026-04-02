@@ -1,6 +1,4 @@
-# 🐾 SniffCLI the Sniffer Sentry
-
-> *"If it works on my machine, it's production ready."*
+# SniffCLI
 
 An extremely minimal, high-performance packet sniffer built with **Go** and **Bubble Tea**. Designed to monitor local network traffic across home lab hardware, from main rigs to aging e-waste.
 
